@@ -1,10 +1,9 @@
-import re
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 app = FastAPI(
@@ -14,284 +13,212 @@ app = FastAPI(
     redoc_url="/redoc"
 )
 
-tasks_db: List[Dict] = []
-max_current_id = 0
+tasks_db: List[Dict] = [
+    {
+        "id": 1,
+        "title": "Thiet ke database Shop AI",
+        "description": "Xay dung bang va toi uu index",
+        "assignee": "QuyDev",
+        "priority": 1,
+        "status": "todo",
+        "created_at": "2026-07-01T09:00:00Z"
+    },
+    {
+        "id": 2,
+        "title": "Code bo API Authen",
+        "description": "Trien khai filter verify JWT token",
+        "assignee": "FixerQ",
+        "priority": 2,
+        "status": "done",
+        "created_at": "2026-07-01T10:00:00Z"
+    }
+]
 
 
 class TaskCreateSchema(BaseModel):
-    title: str = Field(..., min_length=3, max_length=150)
-    description: str
-    assignee: str = Field(..., min_length=2)
+    title: str = Field(..., min_length=3, max_length=100)
+    description: str = Field(..., min_length=1)
+    assignee: str = Field(..., min_length=1)
     priority: int = Field(..., ge=1, le=5)
 
+    @field_validator('description', 'assignee')
+    @classmethod
+    def check_not_empty_or_whitespace(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("Field cannot be empty or whitespace only")
+        return v.strip()
 
-class TaskUpdateSchema(BaseModel):
-    title: str = Field(..., min_length=3, max_length=150)
-    description: str
-    assignee: str = Field(..., min_length=2)
-    priority: int = Field(..., ge=1, le=5)
+
+class TaskStatusUpdateSchema(BaseModel):
     status: str
 
+    @field_validator('status')
+    @classmethod
+    def validate_status_enum(cls, v: str) -> str:
+        allowed = ["todo", "in_progress", "done"]
+        if v not in allowed:
+            raise ValueError(f"Invalid status. Allowed values: {allowed}")
+        return v
 
-def create_error_envelope(status_code: int, message: str, error_code: str, tech_detail: str, path: str) -> JSONResponse:
+
+def create_unified_envelope(status_code: int, message: str, data: any, error: Optional[str], path: str) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
         content={
             "statusCode": status_code,
             "message": message,
-            "data": None,
-            "error": f"{error_code}: {tech_detail}" if error_code else tech_detail,
+            "data": data,
+            "error": error,
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "path": path
         }
     )
 
 
+def calculate_team_metrics() -> Tuple[int, int, float]:
+    total_tasks = len(tasks_db)
+    if total_tasks == 0:
+        return 0, 0, 0.0
+    completed_tasks = sum(1 for task in tasks_db if task["status"] == "done")
+    completion_rate_percentage = round((completed_tasks / total_tasks) * 100.0, 2)
+    return total_tasks, completed_tasks, completion_rate_percentage
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    path = request.url.path
-    errors = exc.errors()
-    
-    if errors:
-        loc = errors[0].get("loc", [])
-        type_str = errors[0].get("type", "")
-        
-        if "priority" in loc and ("ctx" in errors[0] and ("gt" in errors[0]["ctx"] or "lt" in errors[0]["ctx"] or "ge" in errors[0]["ctx"] or "le" in errors[0]["ctx"])):
-            return create_error_envelope(
-                status_code=422,
-                message="Lỗi: Mức độ ưu tiên công việc không hợp lệ (Phải từ 1 đến 5)!",
-                error_code="ERR-TASK-02",
-                tech_detail="Validation error: Priority field numerical bounds limits constraint violation. Value must be ge=1 and le=5.",
-                path=path
-            )
-            
-        if len(loc) > 1 and loc[0] == "path" and loc[1] == "task_id" and "type_error" in type_str:
-            return create_error_envelope(
-                status_code=422,
-                message="Lỗi: Dữ liệu đầu vào sai định dạng hoặc thiếu trường bắt buộc!",
-                error_code="ERR-VAL-422",
-                tech_detail="Gateway validation error: Input json parameters datatype hints mismatch or core required fields missing.",
-                path=path
-            )
-
-    return create_error_envelope(
+    return create_unified_envelope(
         status_code=422,
-        message="Lỗi: Dữ liệu đầu vào sai định dạng hoặc thiếu trường bắt buộc!",
-        error_code="ERR-VAL-422",
-        tech_detail="Gateway validation error: Input json parameters datatype hints mismatch or core required fields missing.",
-        path=path
+        message="Lỗi: Dữ liệu đầu vào không hợp lệ hoặc sai định dạng quy định!",
+        data=None,
+        error="ERR-VAL-422: Validation error at Request Body fields constraint layout.",
+        path=request.url.path
     )
 
 
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
-    if isinstance(exc.detail, dict):
+    if isinstance(exc.detail, dict) and "statusCode" in exc.detail:
         return JSONResponse(status_code=exc.status_code, content=exc.detail)
     
-    return create_error_envelope(
+    return create_unified_envelope(
         status_code=exc.status_code,
-        message="Hệ thống phát sinh lỗi ngoại lệ.",
-        error_code="",
-        tech_detail=str(exc.detail),
+        message="Hệ thống phát sinh lỗi cấu trúc hoặc định tuyến.",
+        data=None,
+        error=f"ERR-HTTP-{exc.status_code}: {str(exc.detail)}",
         path=request.url.path
     )
 
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    return create_error_envelope(
+    return create_unified_envelope(
         status_code=500,
         message="Lỗi hệ thống nội bộ.",
-        error_code="ERR-INTERNAL",
-        tech_detail="An unexpected error occurred on the server.",
+        data=None,
+        error="ERR-INTERNAL-500: An unexpected runtime error occurred on the server.",
         path=request.url.path
     )
 
 
-@app.get("/tasks/search")
-async def search_tasks(request: Request, keyword: Optional[str] = None, status: Optional[str] = None):
-    filtered_tasks = []
-    
-    for task in tasks_db:
-        match_keyword = True
-        match_status = True
-        
-        if keyword:
-            pattern = re.compile(re.escape(keyword), re.IGNORECASE)
-            match_title = bool(pattern.search(task["title"]))
-            match_assignee = bool(pattern.search(task["assignee"]))
-            match_keyword = match_title or match_assignee
-            
-        if status:
-            match_status = (task["status"] == status)
-            
-        if match_keyword and match_status:
-            filtered_tasks.append({
-                "id": task["id"],
-                "title": task["title"],
-                "description": task["description"],
-                "assignee": task["assignee"],
-                "priority": task["priority"],
-                "status": task["status"],
-                "created_at": task["created_at"]
-            })
-            
-    return {
-        "total": len(filtered_tasks),
-        "results": filtered_tasks
-    }
+@app.get("/tasks")
+async def get_all_tasks(request: Request, status: Optional[str] = None):
+    if status:
+        filtered_tasks = [task for task in tasks_db if task["status"] == status]
+    else:
+        filtered_tasks = tasks_db
+
+    return create_unified_envelope(
+        status_code=200,
+        message="Lấy danh sách công việc thành công!",
+        data=filtered_tasks,
+        error=None,
+        path=request.url.path
+    )
 
 
 @app.post("/tasks", status_code=status.HTTP_201_CREATED)
 async def create_task(task_in: TaskCreateSchema, request: Request):
-    global max_current_id
-    path = request.url.path
-    
     for task in tasks_db:
         if task["title"] == task_in.title:
-            return create_error_envelope(
+            return create_unified_envelope(
                 status_code=400,
                 message="Lỗi: Tiêu đề công việc này đã tồn tại trong nhóm!",
-                error_code="ERR-TASK-01",
-                tech_detail="Task conflict: Title field values duplicates an existing record in the temporary database storage.",
-                path=path
+                data=None,
+                error="ERR-TASK-01: Task conflict: Title field duplicates an existing record.",
+                path=request.url.path
             )
-            
-    max_current_id += 1
+
+    max_id = max([task["id"] for task in tasks_db]) if tasks_db else 0
+    new_id = max_id + 1
     current_time = datetime.utcnow().isoformat() + "Z"
-    
+
     new_task = {
-        "id": max_current_id,
+        "id": new_id,
         "title": task_in.title,
         "description": task_in.description,
         "assignee": task_in.assignee,
         "priority": task_in.priority,
         "status": "todo",
-        "created_at": current_time,
-        "internal_notes": "Internal admin log info"
+        "created_at": current_time
     }
-    
     tasks_db.append(new_task)
-    
-    return {
-        "statusCode": 201,
-        "message": "Tạo mới công việc nhóm thành công!",
-        "data": {
-            "id": new_task["id"],
-            "title": new_task["title"],
-            "description": new_task["description"],
-            "assignee": new_task["assignee"],
-            "priority": new_task["priority"],
-            "status": new_task["status"],
-            "created_at": new_task["created_at"]
-        },
-        "error": None,
-        "timestamp": current_time,
-        "path": path
-    }
 
-
-@app.get("/tasks/{task_id}")
-async def read_task_detail(task_id: int, request: Request):
-    path = request.url.path
-    
-    task = next((t for t in tasks_db if t["id"] == task_id), None)
-    
-    if task is None:
-        return create_error_envelope(
-            status_code=404,
-            message="Lỗi: Không tìm thấy ID công việc yêu cầu trong hệ thống!",
-            error_code="ERR-TASK-04",
-            tech_detail="Resource missing error: Target task entity parameter [task_id] can not be located within current active database scope.",
-            path=path
-        )
-        
-    return {
-        "statusCode": 200,
-        "message": "Lấy chi tiết thông tin công việc thành công!",
-        "data": {
-            "id": task["id"],
-            "title": task["title"],
-            "description": task["description"],
-            "assignee": task["assignee"],
-            "priority": task["priority"],
-            "status": task["status"],
-            "created_at": task["created_at"]
-        },
-        "error": None,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "path": path
-    }
+    return create_unified_envelope(
+        status_code=201,
+        message="Khởi tạo công việc mới thành công!",
+        data=new_task,
+        error=None,
+        path=request.url.path
+    )
 
 
 @app.put("/tasks/{task_id}")
-async def update_task(task_id: int, task_in: TaskUpdateSchema, request: Request):
-    path = request.url.path
-    
-    task_index = next((index for index, t in enumerate(tasks_db) if t["id"] == task_id), None)
-    
-    if task_index is None:
-        return create_error_envelope(
+async def update_task_status(task_id: int, status_in: TaskStatusUpdateSchema, request: Request):
+    target_task = next((task for task in tasks_db if task["id"] == task_id), None)
+
+    if not target_task:
+        return create_unified_envelope(
             status_code=404,
             message="Lỗi: Không tìm thấy ID công việc yêu cầu trong hệ thống!",
-            error_code="ERR-TASK-04",
-            tech_detail="Resource missing error: Target task entity parameter [task_id] can not be located within current active database scope.",
-            path=path
+            data=None,
+            error="ERR-TASK-03: Resource missing error: Target task entity parameter [task_id] cannot be located.",
+            path=request.url.path
         )
-        
-    if task_in.status not in ["todo", "in_progress", "done"]:
-        return create_error_envelope(
+
+    if target_task["status"] == "done":
+        return create_unified_envelope(
             status_code=400,
-            message="Lỗi: Trạng thái công việc cập nhật không đúng quy định!",
-            error_code="ERR-TASK-03",
-            tech_detail="Business logic error: Invalid task status value. Allowed enumerated selection list: ['todo', 'in_progress', 'done'].",
-            path=path
+            message="Lỗi: Công việc đã hoàn thành, không thể thay đổi trạng thái lùi lại!",
+            data=None,
+            error="ERR-TASK-04: Business logic error: Modification denied. Task status is already locked as 'done'.",
+            path=request.url.path
         )
-        
-    current_task = tasks_db[task_index]
+
+    target_task["status"] = status_in.status
+
+    return create_unified_envelope(
+        status_code=200,
+        message="Cập nhật tiến độ công việc thành công!",
+        data=target_task,
+        error=None,
+        path=request.url.path
+    )
+
+
+@app.get("/tasks/analytics/dashboard")
+async def get_dashboard_analytics(request: Request):
+    total_tasks, completed_tasks, completion_rate_percentage = calculate_team_metrics()
     
-    current_task.update({
-        "title": task_in.title,
-        "description": task_in.description,
-        "assignee": task_in.assignee,
-        "priority": task_in.priority,
-        "status": task_in.status
-    })
-    
-    return {
-        "statusCode": 200,
-        "message": "Cập nhật thông tin công việc thành công!",
-        "data": {
-            "id": current_task["id"],
-            "title": current_task["title"],
-            "description": current_task["description"],
-            "assignee": current_task["assignee"],
-            "priority": current_task["priority"],
-            "status": current_task["status"],
-            "created_at": current_task["created_at"]
-        },
-        "error": None,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "path": path
+    analytics_data = {
+        "total_tasks": total_tasks,
+        "completed_tasks": completed_tasks,
+        "completion_rate_percentage": completion_rate_percentage
     }
 
-
-@app.delete("/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_task(task_id: int, request: Request):
-    path = request.url.path
-    
-    task_index = next((index for index, t in enumerate(tasks_db) if t["id"] == task_id), None)
-    
-    if task_index is None:
-        return create_error_envelope(
-            status_code=404,
-            message="Lỗi: Không tìm thấy ID công việc yêu cầu trong hệ thống!",
-            error_code="ERR-TASK-04",
-            tech_detail="Resource missing error: Target task entity parameter [task_id] can not be located within current active database scope.",
-            path=path
-        )
-        
-    tasks_db.pop(task_index)
-    
-    return JSONResponse(status_code=status.HTTP_204_NO_CONTENT, content=None)
-
+    return create_unified_envelope(
+        status_code=200,
+        message="Lấy số liệu thống kê hiệu suất nhóm thành công!",
+        data=analytics_data,
+        error=None,
+        path=request.url.path
+    )
